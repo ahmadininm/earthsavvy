@@ -197,17 +197,39 @@ st.markdown("---")
 st.sidebar.header("🛠 Model Parameters")
 
 with st.sidebar.expander("Physics Assumptions", expanded=True):
-    p_t_amb = st.number_input("Ambient Temp (°C)", value=10.0, step=1.0, help="Baseline annual average air temperature.")
-    p_emis = st.number_input("Emissivity (0-1)", value=0.9, step=0.05, help="0.9 for brick/concrete/painted metal.")
-    p_h_conv = st.number_input("Conv. Coeff (W/m²K)", value=10.0, step=1.0, help="10=Indoor/Calm, 25=Outdoor/Windy.")
+    p_t_amb = st.number_input(
+        "Ambient Temp (°C)", 
+        value=10.0, 
+        step=1.0, 
+        help="The baseline air temperature surrounding the object. \n\nLogic: Heat loss depends on the difference between the Object Temp and this Ambient Temp."
+    )
+    p_emis = st.number_input(
+        "Emissivity (0-1)", 
+        value=0.9, 
+        step=0.05, 
+        help="How efficiently the surface radiates heat.\n\n- 0.90: Brick, Concrete, Painted Metal\n- 0.10: Polished Aluminium/Steel\n\nLogic: Higher emissivity = Higher radiative heat loss."
+    )
+    p_h_conv = st.number_input(
+        "Conv. Coeff (W/m²K)", 
+        value=10.0, 
+        step=1.0, 
+        help="Represents how much air movement cools the surface.\n\n- 10: Indoor / Still Air\n- 25: Outdoor / Windy\n\nLogic: Higher value = Faster cooling due to wind."
+    )
 
 with st.sidebar.expander("Financials", expanded=True):
-    p_tariff = st.number_input("Elec Tariff (£/kWh)", value=0.15, format="%.3f")
-    p_carbon = st.number_input("Grid Carbon (kgCO2e/kWh)", value=0.193, format="%.3f")
-    p_duty = st.slider("Duty Cycle", 0.1, 1.0, 1.0, help="1.0 = 24/7/365 operation.")
+    p_tariff = st.number_input("Elec Tariff (£/kWh)", value=0.15, format="%.3f", help="Cost of electricity per kilowatt-hour.")
+    p_carbon = st.number_input("Grid Carbon (kgCO2e/kWh)", value=0.193, format="%.3f", help="Carbon intensity of the electricity grid (UK Avg ~0.193).")
+    p_duty = st.slider(
+        "Duty Cycle", 0.1, 1.0, 1.0, 
+        help="The fraction of the year the asset is hot.\n\n- 1.0: Running 24/7 (8760 hrs)\n- 0.5: Running 12 hours a day\n- 0.25: Running 8 hours a day, Mon-Fri"
+    )
 
 st.sidebar.markdown("---")
-p_default_area = st.sidebar.number_input("Default Area (m²)", value=5.0, help="Used if data column is 0 or missing.")
+p_default_area = st.sidebar.number_input(
+    "Default Area (m²)", 
+    value=5.0, 
+    help="If your data file does not have an 'Area' column (or if the value is 0), the tool will use this value to calculate total heat loss."
+)
 
 model_params = {
     't_ambient': p_t_amb,
@@ -232,13 +254,13 @@ with tab1:
     
     with col_u1:
         st.subheader("Upload")
-        uploaded_files = st.file_uploader("Drop files here", accept_multiple_files=True, type=['json', 'csv'])
+        uploaded_files = st.file_uploader("Drop files here", accept_multiple_files=True, type=['json', 'csv'], help="Supports .json export files from EarthSavvy or standard .csv files.")
     
     with col_u2:
         st.subheader("Local Folder Scan")
         # Automatically find files in current directory for convenience
         local_files = [f for f in os.listdir('.') if f.endswith(('.json', '.csv')) and 'requirements' not in f]
-        selected_local = st.multiselect("Select local files:", local_files)
+        selected_local = st.multiselect("Select local files:", local_files, help="These files were detected in the same folder as this script.")
 
     all_records = []
     
@@ -286,6 +308,7 @@ with tab1:
         st.success(f"✅ Loaded {len(master_df)} data points from {len(files_to_process)} files.")
         
         with st.expander("Peek at Raw Data"):
+            st.caption("This table shows a preview of the data loaded. The 'raw_data' column contains the list [Time, Value1, Value2] which we will map in the next tab.")
             # Convert list column to string for display safety
             disp = master_df.head(5).copy()
             if 'raw_data' in disp.columns:
@@ -309,10 +332,16 @@ with tab2:
         
         c1, c2, c3 = st.columns(3)
         with c1:
-            temp_idx = st.number_input("Temperature Column Index", 0, 10, 1, help="Usually index 1.")
+            temp_idx = st.number_input(
+                "Temperature Column Index", 0, 10, 1, 
+                help="Look at the Sample Row above. Count from 0. Which position holds the Temperature?\n\nExample: ['Date', 50.5, 10] -> Index 1 is Temp (50.5)"
+            )
         with c2:
-            use_area = st.checkbox("Map Area Column?", value=False)
-            area_idx = st.number_input("Area Column Index", 0, 10, 2, disabled=not use_area)
+            use_area = st.checkbox("Map Area Column?", value=False, help="Check this if your data contains an Area value (m2) for each point.")
+            area_idx = st.number_input(
+                "Area Column Index", 0, 10, 2, disabled=not use_area,
+                help="Look at the Sample Row above. Which position holds the Area?"
+            )
         with c3:
             st.markdown(f"**Default Area:** {p_default_area} m²")
             st.caption("Applied if mapped column is 0 or unmapped.")
@@ -368,10 +397,29 @@ with tab3:
         st.header("Executive Summary")
         
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        kpi1.metric("Est. Annual Cost", f"£{total_cost:,.0f}", delta="Loss Opportunity", delta_color="inverse")
-        kpi2.metric("Carbon Impact", f"{total_co2:,.1f} tCO2e", delta="Avoidable Emissions", delta_color="inverse")
+        kpi1.metric("Est. Annual Cost", f"£{total_cost:,.0f}", delta="Loss Opportunity", delta_color="inverse", help="Total money wasted per year due to heat loss (Convection + Radiation).")
+        kpi2.metric("Carbon Impact", f"{total_co2:,.1f} tCO2e", delta="Avoidable Emissions", delta_color="inverse", help="Total CO2 emissions associated with the wasted energy.")
         kpi3.metric("Sites Analyzed", len(res_df['site_name'].unique()))
         kpi4.metric("Avg Surface Temp", f"{avg_temp:.1f} °C")
+        
+        # METHODOLOGY EXPANDER (Detailed explanation)
+        with st.expander("📘 How is this calculated? (Methodology)"):
+            st.markdown("""
+            **The calculation uses standard Heat Transfer physics:**
+            
+            $$Q_{total} = Q_{convection} + Q_{radiation}$$
+            
+            1. **Convection:** Energy lost to the air moving over the surface.
+               $$Q_{conv} = h \cdot A \cdot (T_{surface} - T_{ambient})$$
+               *Where $h$ is the Convection Coefficient set in the sidebar.*
+               
+            2. **Radiation:** Energy radiated as infrared waves.
+               $$Q_{rad} = \epsilon \cdot \sigma \cdot A \cdot (T_{surface}^4 - T_{ambient}^4)$$
+               *Where $\epsilon$ is Emissivity and $\sigma$ is the Stefan-Boltzmann constant.*
+            
+            3. **Annualisation:**
+               $$Cost = (Q_{total} / 1000) \times 8760_{hrs} \times DutyCycle \times Tariff$$
+            """)
         
         st.markdown("---")
         
@@ -442,7 +490,7 @@ Attached is the detailed dataset.
 
 Regards,
             """
-            st.text_area("Copy this text for your report:", email_text, height=250)
+            st.text_area("Copy this text for your report:", email_text, height=250, help="This is a template email you can copy and send to stakeholders.")
             
     else:
         st.info("Run analysis to enable exports.")
