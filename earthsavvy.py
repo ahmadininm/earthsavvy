@@ -244,7 +244,11 @@ with tab_upload:
         st.success(f"Loaded {len(master_df)} records from {len(set(master_df['source_file']))} files.")
         
         st.write("##### Raw Data Preview")
-        st.dataframe(master_df.head())
+        # FIXED: Create a display copy and cast list columns to string to avoid PyArrow error
+        display_df = master_df.head().copy()
+        if 'raw_data' in display_df.columns:
+            display_df['raw_data'] = display_df['raw_data'].astype(str)
+        st.dataframe(display_df)
     else:
         st.info("Please upload files or select local files to proceed.")
         st.stop()
@@ -263,8 +267,12 @@ with tab_map:
         df = st.session_state['master_df']
         
         # Analyze the first row's data structure to help user choose
-        sample_row = df.iloc[0]['raw_data']
-        st.code(f"Sample Data Row Structure: {sample_row}")
+        if not df.empty and 'raw_data' in df.columns:
+            sample_row = df.iloc[0]['raw_data']
+            st.code(f"Sample Data Row Structure: {sample_row}")
+        else:
+            st.warning("Dataframe appears empty or missing 'raw_data' column.")
+            sample_row = []
         
         col1, col2 = st.columns(2)
         with col1:
@@ -293,8 +301,9 @@ with tab_map:
                 if res:
                     # Merge original metadata with calculation results
                     full_row = row.to_dict()
-                    # Remove raw_data to keep it clean
-                    del full_row['raw_data']
+                    # Remove raw_data to keep it clean (and prevent Arrow errors later)
+                    if 'raw_data' in full_row:
+                        del full_row['raw_data']
                     full_row.update(res)
                     results.append(full_row)
                 
