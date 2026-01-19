@@ -10,16 +10,24 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # -----------------------------------------------------------------------------
-# APP CONFIG & HELPER FUNCTIONS
+# APP CONFIG
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Thermal-to-CAPEX (EarthSavvy Add-on)",
+    page_title="Thermal-to-CAPEX | EarthSavvy & AME",
     page_icon="🔥",
     layout="wide"
 )
 
-# Constants for Physics
+# -----------------------------------------------------------------------------
+# CONSTANTS & PHYSICS
+# -----------------------------------------------------------------------------
 STEFAN_BOLTZMANN = 5.67e-8  # W/m2/K4
+
+def load_image(image_name):
+    """Helper to verify image exists before displaying to prevent errors."""
+    if os.path.exists(image_name):
+        return image_name
+    return None
 
 def flatten_earthsavvy_json(file_content, filename):
     """
@@ -38,7 +46,6 @@ def flatten_earthsavvy_json(file_content, filename):
                 raw_rows = site_content.get('data', [])
                 
                 for row in raw_rows:
-                    # Basic canonical record
                     record = {
                         'source_file': filename,
                         'site_id': site_key,
@@ -49,11 +56,10 @@ def flatten_earthsavvy_json(file_content, filename):
                     # Attempt to parse timestamp from first column
                     if row and len(row) > 0:
                         try:
-                            # Try standard EarthSavvy format "YYYY-MM-DD HH:MM"
                             ts_str = str(row[0])
+                            # Handles ISO format standard in EarthSavvy
                             ts = pd.to_datetime(ts_str, errors='coerce')
-                            if pd.notnull(ts):
-                                record['timestamp'] = ts
+                            record['timestamp'] = ts
                         except:
                             record['timestamp'] = None
                     
@@ -69,22 +75,31 @@ def estimate_heat_loss(row, temp_col_idx, area_col_idx, params):
     Physics engine for heat loss estimation.
     """
     try:
-        # Extract data from raw list
         data_row = row['raw_data']
         
-        # Get Surface Temp (T_s)
+        # --- 1. GET TEMPERATURE ---
         if temp_col_idx is not None and len(data_row) > temp_col_idx:
-            t_surf_input = float(data_row[temp_col_idx])
+            val = data_row[temp_col_idx]
+            # Handle potential None or non-numeric
+            t_surf_input = float(val) if val is not None else 0.0
         else:
-            return None # Cannot calc without temp
+            return None 
             
-        # Get Area (A)
+        # --- 2. GET AREA ---
+        # Logic: If area column is mapped, check if it has valid data (>0).
+        # If it is 0.0 or missing, FALLBACK to default_area.
+        area = 0.0
         if area_col_idx is not None and len(data_row) > area_col_idx:
-            area = float(data_row[area_col_idx])
-        else:
+            try:
+                area = float(data_row[area_col_idx])
+            except:
+                area = 0.0
+        
+        # Fallback check
+        if area <= 0.001:
             area = params['default_area']
 
-        # Unit conversion
+        # --- 3. PHYSICS CALC ---
         t_surf_c = t_surf_input
         t_amb_c = params['t_ambient']
         
@@ -92,24 +107,29 @@ def estimate_heat_loss(row, temp_col_idx, area_col_idx, params):
         tk_surf = t_surf_c + 273.15
         tk_amb = t_amb_c + 273.15
         
-        # 1. Convection: q_conv = h * (T_surf - T_amb)
-        # Ensure T_surf > T_amb for loss, otherwise 0 (or gain, but focused on loss here)
-        delta_t = max(0, t_surf_c - t_amb_c)
+        # A. Convection: q_conv = h * A * (T_surf - T_amb)
+        delta_t = t_surf_c - t_amb_c
+        
+        # If Surface is COLDER than ambient, assume 0 loss (ignore cooling loads for this specific CAPEX tool)
+        if delta_t < 0:
+            delta_t = 0
+            
         q_conv_flux = params['h_conv'] * delta_t # W/m2
         
-        # 2. Radiation: q_rad = eps * sigma * (T_surf^4 - T_amb^4)
-        q_rad_flux = params['emissivity'] * STEFAN_BOLTZMANN * (tk_surf**4 - tk_amb**4)
-        q_rad_flux = max(0, q_rad_flux)
-        
+        # B. Radiation: q_rad = eps * sigma * (T_surf^4 - T_amb^4)
+        if tk_surf > tk_amb:
+            q_rad_flux = params['emissivity'] * STEFAN_BOLTZMANN * (tk_surf**4 - tk_amb**4)
+        else:
+            q_rad_flux = 0
+            
         total_flux = q_conv_flux + q_rad_flux # W/m2
         total_power = total_flux * area # W (Joules/sec)
         
-        # Annualisation
-        # Power (kW) * Hours/Year * Duty Cycle
+        # --- 4. FINANCIALS ---
         power_kw = total_power / 1000.0
+        # Annual KWh = kW * 8760 * duty_cycle
         annual_kwh = power_kw * 8760 * params['duty_cycle']
         
-        # Cost and Carbon
         annual_cost = annual_kwh * params['tariff_gbp_per_kwh']
         annual_carbon = annual_kwh * params['carbon_factor']
         
@@ -127,17 +147,17 @@ def estimate_heat_loss(row, temp_col_idx, area_col_idx, params):
         return None
 
 def classify_hotspot(delta_t, area):
-    """
-    Simple heuristic rule-based classification.
-    """
+    """Heuristic rule-based classification."""
     if delta_t > 50:
-        return "Likely Process Hotspot (High T)"
-    elif delta_t > 10 and area > 50:
-        return "Likely Fabric Loss (Large Area)"
+        return "Critical: Process/Oven Leak"
+    elif delta_t > 20 and area > 20:
+        return "Major: Fabric Insulation Fail"
     elif delta_t > 10:
-        return "Minor Leak / Thermal Bridge"
+        return "Moderate: Thermal Bridge"
+    elif delta_t <= 0:
+        return "No Anomalous Heat"
     else:
-        return "Low/Background Signal"
+        return "Minor/Background"
 
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8')
@@ -146,34 +166,49 @@ def convert_df_to_json(df):
     return df.to_json(orient='records', date_format='iso')
 
 # -----------------------------------------------------------------------------
-# MAIN APP UI
+# UI LAYOUT
 # -----------------------------------------------------------------------------
 
-st.title("🏭 Thermal-to-CAPEX Estimate Tool")
-st.markdown("""
-**EarthSavvy Add-on** | *Screening-Grade Energy & Cost Estimation*
+# --- HEADER WITH LOGOS ---
+# Using 3 columns to place logos on far left and far right
+header_col1, header_col2, header_col3 = st.columns([1, 4, 1])
 
-This tool transforms raw thermal or detection time-series data into actionable CAPEX business cases.
-It calculates heat loss using physics-based approximations (Convection + Radiation) and estimates annual financial and environmental impact.
-""")
+with header_col1:
+    ame_logo = load_image("ame.png")
+    if ame_logo:
+        st.image(ame_logo, width=120)
+    else:
+        st.write("*(AME Logo)*")
+
+with header_col2:
+    st.markdown("<h1 style='text-align: center;'>Thermal-to-CAPEX Calculator</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'><b>EarthSavvy / JLR Clean Futures Support Tool</b></p>", unsafe_allow_html=True)
+
+with header_col3:
+    es_logo = load_image("earthsavvy.png")
+    if es_logo:
+        st.image(es_logo, width=120)
+    else:
+        st.write("*(EarthSavvy Logo)*")
+
+st.markdown("---")
 
 # --- SIDEBAR: GLOBAL SETTINGS ---
-st.sidebar.header("🌍 Global Parameters")
-st.sidebar.markdown("Define baseline assumptions for the physics model.")
+st.sidebar.header("🛠 Model Parameters")
 
-with st.sidebar.expander("Physics Constants", expanded=True):
-    p_t_amb = st.number_input("Ambient Temp (°C)", value=10.0, step=1.0, help="Baseline air temperature.")
-    p_emis = st.number_input("Surface Emissivity (0-1)", value=0.9, step=0.05, help="0.9 for brick/concrete, 0.1 for polished metal.")
-    p_h_conv = st.number_input("Conv. Coeff (h) [W/m²K]", value=10.0, step=1.0, help="10 for calm air, 25 for windy.")
+with st.sidebar.expander("Physics Assumptions", expanded=True):
+    p_t_amb = st.number_input("Ambient Temp (°C)", value=10.0, step=1.0, help="Baseline annual average air temperature.")
+    p_emis = st.number_input("Emissivity (0-1)", value=0.9, step=0.05, help="0.9 for brick/concrete/painted metal.")
+    p_h_conv = st.number_input("Conv. Coeff (W/m²K)", value=10.0, step=1.0, help="10=Indoor/Calm, 25=Outdoor/Windy.")
 
-with st.sidebar.expander("Economic & Operational", expanded=True):
-    p_tariff = st.number_input("Energy Tariff (£/kWh)", value=0.15, format="%.3f")
-    p_carbon = st.number_input("Carbon Factor (kgCO2e/kWh)", value=0.193, format="%.3f", help="UK Grid Average")
-    p_duty = st.slider("Duty Cycle (Scaling)", 0.1, 1.0, 1.0, help="Fraction of year the heat loss occurs (1.0 = 24/7/365).")
+with st.sidebar.expander("Financials", expanded=True):
+    p_tariff = st.number_input("Elec Tariff (£/kWh)", value=0.15, format="%.3f")
+    p_carbon = st.number_input("Grid Carbon (kgCO2e/kWh)", value=0.193, format="%.3f")
+    p_duty = st.slider("Duty Cycle", 0.1, 1.0, 1.0, help="1.0 = 24/7/365 operation.")
 
-p_default_area = st.sidebar.number_input("Default Area (m²)", value=10.0, help="Used if no area column is mapped.")
+st.sidebar.markdown("---")
+p_default_area = st.sidebar.number_input("Default Area (m²)", value=5.0, help="Used if data column is 0 or missing.")
 
-# Store params in dict
 model_params = {
     't_ambient': p_t_amb,
     'emissivity': p_emis,
@@ -185,288 +220,229 @@ model_params = {
 }
 
 # --- TABS ---
-tab_upload, tab_map, tab_analysis, tab_export = st.tabs(["📂 Upload & Data", "⚙️ Map Columns", "📊 Results & CAPEX", "💾 Export"])
+tab1, tab2, tab3, tab4 = st.tabs(["📂 1. Upload", "⚙️ 2. Map & Calibrate", "📊 3. Business Case", "💾 4. Export"])
 
 # =============================================================================
-# TAB 1: UPLOAD & DETECT
+# TAB 1: UPLOAD
 # =============================================================================
-with tab_upload:
-    st.subheader("Import EarthSavvy Data")
+with tab1:
+    st.info("Upload EarthSavvy JSON exports or standard CSVs to begin.")
     
-    # 1. Scan Local Directory
-    st.write("### 1. Local File Scan")
-    local_files = [f for f in os.listdir('.') if f.endswith(('.json', '.csv'))]
-    selected_local_files = st.multiselect("Select files found in folder:", local_files)
+    col_u1, col_u2 = st.columns(2)
     
-    # 2. Upload via UI
-    st.write("### 2. Upload Files")
-    uploaded_files = st.file_uploader("Drop JSON/CSV files here", accept_multiple_files=True, type=['json', 'csv'])
+    with col_u1:
+        st.subheader("Upload")
+        uploaded_files = st.file_uploader("Drop files here", accept_multiple_files=True, type=['json', 'csv'])
     
+    with col_u2:
+        st.subheader("Local Folder Scan")
+        # Automatically find files in current directory for convenience
+        local_files = [f for f in os.listdir('.') if f.endswith(('.json', '.csv')) and 'requirements' not in f]
+        selected_local = st.multiselect("Select local files:", local_files)
+
     all_records = []
     
-    # Process Local Files
-    for fname in selected_local_files:
-        try:
-            with open(fname, 'r') as f:
-                content = f.read()
-                if fname.endswith('.json'):
-                    df_local = flatten_earthsavvy_json(content, fname)
-                    if not df_local.empty:
-                        all_records.append(df_local)
-        except Exception as e:
-            st.warning(f"Could not read local file {fname}: {e}")
-
-    # Process Uploaded Files
+    # Process Files
+    files_to_process = []
+    
+    # 1. Handle Streamlit Uploads
     if uploaded_files:
         for uf in uploaded_files:
-            content = uf.read().decode('utf-8')
-            if uf.name.endswith('.json'):
-                df_up = flatten_earthsavvy_json(content, uf.name)
-                if not df_up.empty:
-                    all_records.append(df_up)
-            elif uf.name.endswith('.csv'):
-                try:
-                    df_csv = pd.read_csv(io.StringIO(content))
-                    # Basic canonicalisation for CSV
-                    df_csv['source_file'] = uf.name
-                    df_csv['site_id'] = df_csv.get('site_id', 'Unknown')
-                    # Wrap rows into 'raw_data' to match JSON structure logic
-                    # This is a simplification; in a real app, we'd handle CSVs more robustly
-                    df_csv['raw_data'] = df_csv.values.tolist()
-                    all_records.append(df_csv)
-                except Exception as e:
-                    st.error(f"Error reading CSV {uf.name}: {e}")
+            files_to_process.append({'name': uf.name, 'content': uf.read().decode('utf-8')})
+            
+    # 2. Handle Local Files
+    for lf in selected_local:
+        try:
+            with open(lf, 'r') as f:
+                files_to_process.append({'name': lf, 'content': f.read()})
+        except Exception as e:
+            st.warning(f"Skipped {lf}: {e}")
+            
+    # Parsing Logic
+    for file_obj in files_to_process:
+        fname = file_obj['name']
+        content = file_obj['content']
+        
+        if fname.endswith('.json'):
+            df_temp = flatten_earthsavvy_json(content, fname)
+            if not df_temp.empty:
+                all_records.append(df_temp)
+        elif fname.endswith('.csv'):
+            try:
+                df_csv = pd.read_csv(io.StringIO(content))
+                df_csv['source_file'] = fname
+                df_csv['site_id'] = df_csv.get('site_id', 'Unknown')
+                df_csv['site_name'] = df_csv.get('site_name', 'Unknown')
+                # Create raw_data list for consistency
+                df_csv['raw_data'] = df_csv.values.tolist()
+                all_records.append(df_csv)
+            except:
+                pass
 
-    # Combine
     if all_records:
         master_df = pd.concat(all_records, ignore_index=True)
         st.session_state['master_df'] = master_df
-        st.success(f"Loaded {len(master_df)} records from {len(set(master_df['source_file']))} files.")
         
-        st.write("##### Raw Data Preview")
-        # FIXED: Create a display copy and cast list columns to string to avoid PyArrow error
-        display_df = master_df.head().copy()
-        if 'raw_data' in display_df.columns:
-            display_df['raw_data'] = display_df['raw_data'].astype(str)
-        st.dataframe(display_df)
+        st.success(f"✅ Loaded {len(master_df)} data points from {len(files_to_process)} files.")
+        
+        with st.expander("Peek at Raw Data"):
+            # Convert list column to string for display safety
+            disp = master_df.head(5).copy()
+            if 'raw_data' in disp.columns:
+                disp['raw_data'] = disp['raw_data'].astype(str)
+            st.dataframe(disp)
     else:
-        st.info("Please upload files or select local files to proceed.")
-        st.stop()
+        st.warning("No data loaded yet.")
 
 # =============================================================================
-# TAB 2: MAP COLUMNS
+# TAB 2: MAP
 # =============================================================================
-with tab_map:
-    st.subheader("Map Data Columns to Physics Model")
-    st.markdown("""
-    The tool needs to know which columns in your data represent **Temperature** and **Area**. 
-    EarthSavvy JSONs often have data arrays like `["Timestamp", Value1, Value2]`.
-    """)
-    
+with tab2:
     if 'master_df' in st.session_state:
         df = st.session_state['master_df']
+        st.subheader("Map Data Columns")
+        st.markdown("Identify which columns inside the data array correspond to **Temperature** and **Area**.")
         
-        # Analyze the first row's data structure to help user choose
-        if not df.empty and 'raw_data' in df.columns:
-            sample_row = df.iloc[0]['raw_data']
-            st.code(f"Sample Data Row Structure: {sample_row}")
-        else:
-            st.warning("Dataframe appears empty or missing 'raw_data' column.")
-            sample_row = []
+        # Show sample
+        sample_row = df.iloc[0]['raw_data'] if not df.empty else []
+        st.code(f"Sample Row Structure: {sample_row}", language="json")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Temperature Input**")
-            temp_idx = st.number_input("Index of Temperature Column (0-based)", min_value=0, value=1, step=1, help="Usually index 1 in EarthSavvy exports.")
-            
-        with col2:
-            st.markdown("**Area Input (Optional)**")
-            use_area_col = st.checkbox("Read Area from data column?", value=False)
-            area_idx = None
-            if use_area_col:
-                area_idx = st.number_input("Index of Area Column (0-based)", min_value=0, value=2, step=1)
-            else:
-                st.info(f"Using fixed default area: {p_default_area} m² (change in sidebar)")
-                
-        if st.button("Run Engineering Analysis"):
-            # Apply Calculations
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            temp_idx = st.number_input("Temperature Column Index", 0, 10, 1, help="Usually index 1.")
+        with c2:
+            use_area = st.checkbox("Map Area Column?", value=False)
+            area_idx = st.number_input("Area Column Index", 0, 10, 2, disabled=not use_area)
+        with c3:
+            st.markdown(f"**Default Area:** {p_default_area} m²")
+            st.caption("Applied if mapped column is 0 or unmapped.")
+
+        if st.button("🚀 Run Analysis", type="primary"):
             results = []
+            valid_count = 0
             
             # Progress bar
-            progress_bar = st.progress(0)
-            total_rows = len(df)
+            bar = st.progress(0)
             
             for i, row in df.iterrows():
-                res = estimate_heat_loss(row, temp_idx, area_idx, model_params)
+                res = estimate_heat_loss(row, temp_idx, area_idx if use_area else None, model_params)
                 if res:
-                    # Merge original metadata with calculation results
                     full_row = row.to_dict()
-                    # Remove raw_data to keep it clean (and prevent Arrow errors later)
-                    if 'raw_data' in full_row:
-                        del full_row['raw_data']
+                    if 'raw_data' in full_row: del full_row['raw_data']
                     full_row.update(res)
                     results.append(full_row)
+                    valid_count += 1
                 
-                if i % 100 == 0:
-                    progress_bar.progress(min(i / total_rows, 1.0))
+                if i % 50 == 0:
+                    bar.progress(min(i / len(df), 1.0))
             
-            progress_bar.progress(1.0)
+            bar.progress(1.0)
             
             if results:
-                st.session_state['results_df'] = pd.DataFrame(results)
-                st.success("Analysis Complete! Go to 'Results' tab.")
+                res_df = pd.DataFrame(results)
+                st.session_state['results_df'] = res_df
+                
+                # SANITY CHECK WARNING
+                max_temp = res_df['temp_c'].max()
+                if max_temp < 5.0:
+                    st.warning(f"⚠️ Warning: Max temperature detected is only {max_temp:.2f}. Are the input columns normalised (0-1) instead of Celsius?")
+                else:
+                    st.success(f"Analysis Complete! {valid_count} records processed.")
             else:
-                st.error("Analysis failed. Check your column indices.")
+                st.error("Analysis failed. Check indices.")
+    else:
+        st.info("Go to Upload tab first.")
 
 # =============================================================================
-# TAB 3: RESULTS
+# TAB 3: BUSINESS CASE
 # =============================================================================
-with tab_analysis:
+with tab3:
     if 'results_df' in st.session_state:
         res_df = st.session_state['results_df']
         
-        st.subheader("🏆 Portfolio Summary")
-        
-        # KPI Cards
-        kpi1, kpi2, kpi3 = st.columns(3)
+        # TOTALS
         total_cost = res_df['annual_cost_gbp'].sum()
-        total_kwh = res_df['annual_kwh'].sum()
         total_co2 = res_df['annual_tco2e'].sum()
+        avg_temp = res_df['temp_c'].mean()
         
-        kpi1.metric("Total Avoidable Cost", f"£{total_cost:,.0f}", help="Based on estimated heat loss and tariff")
-        kpi2.metric("Total Energy Loss", f"{total_kwh:,.0f} kWh")
-        kpi3.metric("Carbon Footprint", f"{total_co2:,.1f} tCO2e")
+        st.header("Executive Summary")
+        
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        kpi1.metric("Est. Annual Cost", f"£{total_cost:,.0f}", delta="Loss Opportunity", delta_color="inverse")
+        kpi2.metric("Carbon Impact", f"{total_co2:,.1f} tCO2e", delta="Avoidable Emissions", delta_color="inverse")
+        kpi3.metric("Sites Analyzed", len(res_df['site_name'].unique()))
+        kpi4.metric("Avg Surface Temp", f"{avg_temp:.1f} °C")
         
         st.markdown("---")
         
-        # Ranking Table
-        st.write("### 🏢 Site/Asset Ranking")
-        st.markdown("Aggregated by Site Name. Click headers to sort.")
+        # CHARTS
+        c_chart1, c_chart2 = st.columns(2)
         
-        ranking = res_df.groupby('site_name').agg({
-            'annual_cost_gbp': 'sum',
-            'annual_kwh': 'sum',
-            'annual_tco2e': 'sum',
-            'area_m2': 'sum'
-        }).reset_index().sort_values('annual_cost_gbp', ascending=False)
-        
-        st.dataframe(ranking.style.format({
-            'annual_cost_gbp': "£{:,.0f}",
-            'annual_kwh': "{:,.0f}",
-            'annual_tco2e': "{:,.2f}",
-            'area_m2': "{:,.1f}"
-        }), use_container_width=True)
-        
-        # Drill Down
-        st.markdown("---")
-        st.write("### 🔍 Detailed Analysis")
-        
-        col_sel, col_chart = st.columns([1, 2])
-        
-        with col_sel:
-            selected_site = st.selectbox("Select Site to Inspect", res_df['site_name'].unique())
-            site_data = res_df[res_df['site_name'] == selected_site]
+        with c_chart1:
+            st.subheader("Cost by Site")
+            fig_bar = px.bar(res_df.groupby('site_name')['annual_cost_gbp'].sum().reset_index(),
+                             x='site_name', y='annual_cost_gbp',
+                             labels={'annual_cost_gbp': 'Annual Cost (£)'},
+                             color='annual_cost_gbp', color_continuous_scale='OrRd')
+            st.plotly_chart(fig_bar, use_container_width=True)
             
-            st.write(f"**Records:** {len(site_data)}")
-            st.write(f"**Avg Temp:** {site_data['temp_c'].mean():.1f} °C")
-            st.write(f"**Est. Cost:** £{site_data['annual_cost_gbp'].sum():,.0f}")
-            
-            # Classification breakdown
-            st.write("**Hotspot Types:**")
-            counts = site_data['classification'].value_counts()
-            st.dataframe(counts)
+        with c_chart2:
+            st.subheader("Hotspot Severity")
+            fig_pie = px.pie(res_df, names='classification', title='Classification of Thermal Anomalies',
+                             color_discrete_sequence=px.colors.sequential.RdBu)
+            st.plotly_chart(fig_pie, use_container_width=True)
 
-        with col_chart:
-            # Time Series Plot
-            if site_data['timestamp'].notnull().any():
-                fig = px.line(site_data.sort_values('timestamp'), x='timestamp', y='annual_cost_gbp', 
-                              title=f"Estimated Cost Run Rate over Time - {selected_site}",
-                              labels={'annual_cost_gbp': 'Annualised Cost Rate (£/yr)', 'timestamp': 'Date'})
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No timestamp data available for time-series plotting.")
-                # Distribution plot instead
-                fig = px.histogram(site_data, x='temp_c', title=f"Temperature Distribution - {selected_site}")
-                st.plotly_chart(fig, use_container_width=True)
+        # DETAILED TABLE
+        st.subheader("Detailed Asset Register")
+        detailed_view = res_df[['timestamp', 'site_name', 'temp_c', 'area_m2', 'annual_cost_gbp', 'classification']].copy()
+        detailed_view['timestamp'] = detailed_view['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
+        st.dataframe(detailed_view.sort_values('annual_cost_gbp', ascending=False), use_container_width=True)
 
-        # Uncertainty Analysis (Monte Carlo light)
-        with st.expander("🎲 Uncertainty & Sensitivity"):
-            st.write(f"Assuming +/- 20% variance on Heat Transfer Coefficient (h={model_params['h_conv']})")
-            low_bound = total_cost * 0.8
-            high_bound = total_cost * 1.2
-            st.write(f"**Cost Range:** £{low_bound:,.0f} - £{high_bound:,.0f}")
-            
     else:
-        st.info("Please map columns and run analysis in the 'Map Columns' tab first.")
+        st.info("No results yet.")
 
 # =============================================================================
-# TAB 4: EXPORT
+# TAB 4: EXPORT & REPORT
 # =============================================================================
-with tab_export:
-    st.subheader("Generate Reports")
+with tab4:
+    st.subheader("Output & Justification")
     
     if 'results_df' in st.session_state:
         res_df = st.session_state['results_df']
+        total_cost = res_df['annual_cost_gbp'].sum()
+        total_co2 = res_df['annual_tco2e'].sum()
+        top_site = res_df.groupby('site_name')['annual_cost_gbp'].sum().idxmax()
         
-        col1, col2 = st.columns(2)
+        col_ex1, col_ex2 = st.columns(2)
         
-        with col1:
-            st.markdown("#### 1. Download Data")
-            csv = convert_df_to_csv(res_df)
-            json_dat = convert_df_to_json(res_df)
+        with col_ex1:
+            st.markdown("### 📥 Download Data")
+            st.download_button("Download CSV", convert_df_to_csv(res_df), "capex_model_output.csv", "text/csv")
+            st.download_button("Download JSON", convert_df_to_json(res_df), "capex_model_output.json", "application/json")
             
-            st.download_button(
-                label="Download Results (CSV)",
-                data=csv,
-                file_name='earthsavvy_capex_estimates.csv',
-                mime='text/csv',
-            )
+        with col_ex2:
+            st.markdown("### 📧 Generate Justification Email")
             
-            st.download_button(
-                label="Download Results (JSON)",
-                data=json_dat,
-                file_name='earthsavvy_capex_estimates.json',
-                mime='application/json',
-            )
-            
-        with col2:
-            st.markdown("#### 2. HTML Summary Report")
-            if st.button("Generate HTML Report"):
-                # Simple string template
-                total_cost = res_df['annual_cost_gbp'].sum()
-                report_html = f"""
-                <html>
-                <head><title>EarthSavvy CAPEX Report</title></head>
-                <body style="font-family: sans-serif; padding: 20px;">
-                    <h1 style="color: #2E86C1;">Thermal-to-CAPEX Report</h1>
-                    <p>Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-                    <hr>
-                    <h2>Executive Summary</h2>
-                    <p>Total Identified Annual Saving Potential: <strong>£{total_cost:,.2f}</strong></p>
-                    <p>Total Carbon Reduction Potential: <strong>{res_df['annual_tco2e'].sum():,.2f} tCO2e</strong></p>
-                    <h3>Top Opportunities</h3>
-                    <ul>
-                """
-                
-                # Add top 5 sites
-                ranking = res_df.groupby('site_name')['annual_cost_gbp'].sum().sort_values(ascending=False).head(5)
-                for site, cost in ranking.items():
-                    report_html += f"<li><strong>{site}</strong>: £{cost:,.2f}</li>"
-                
-                report_html += """
-                    </ul>
-                    <p><em>Disclaimer: These are screening-grade estimates based on surface temperature anomalies. Verify with direct contact measurement before capital investment.</em></p>
-                </body>
-                </html>
-                """
-                
-                b64 = base64.b64encode(report_html.encode()).decode()
-                href = f'<a href="data:text/html;base64,{b64}" download="capex_report.html">Click here to download HTML Report</a>'
-                st.markdown(href, unsafe_allow_html=True)
-                
-    else:
-        st.info("No results to export yet.")
+            # Auto-generated text
+            email_text = f"""
+Subject: CAPEX Justification - Thermal Loss Analysis Results
 
-# Footer
-st.markdown("---")
-st.caption("Thermal-to-CAPEX Tool v1.0 | Offline Mode | No external API dependencies")
+Hi Team,
+
+Using the EarthSavvy/AME data, we have modeled the thermal efficiency of our monitored assets.
+
+Summary Findings:
+- Total Estimated Annual Loss: £{total_cost:,.0f}
+- Carbon Impact: {total_co2:.1f} tCO2e per year
+- Primary Hotspot Location: {top_site}
+
+Based on these findings, an investment in insulation upgrades for {top_site} is recommended to reduce operational expenditures and meet our EV production sustainability targets.
+
+Attached is the detailed dataset.
+
+Regards,
+            """
+            st.text_area("Copy this text for your report:", email_text, height=250)
+            
+    else:
+        st.info("Run analysis to enable exports.")
